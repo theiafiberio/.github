@@ -1,0 +1,98 @@
+name: Example Project Sync (labels → project fields)
+
+on:
+  workflow_dispatch:
+  issues:
+    types: [labeled, closed]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+  project: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sync to org project (optional, guarded)
+        if: ${{ github.event_name != 'issues' || github.event.action == 'labeled' || github.event.action == 'closed' }}
+        uses: actions/github-script@v7
+        env:
+          ORG_LOGIN: ${{ vars.ORG_LOGIN }}
+          PROJECT_NUMBER: ${{ vars.ORG_PROJECT_NUMBER }}
+          STATUS_FIELD_ID: ${{ vars.ORG_PROJECT_STATUS_FIELD_ID }}
+          TO_DO_OPTION_ID: ${{ vars.ORG_PROJECT_TO_DO_OPTION_ID }}
+          IN_PROGRESS_OPTION_ID: ${{ vars.ORG_PROJECT_IN_PROGRESS_OPTION_ID }}
+          IN_REVIEW_OPTION_ID: ${{ vars.ORG_PROJECT_IN_REVIEW_OPTION_ID }}
+          DONE_OPTION_ID: ${{ vars.ORG_PROJECT_DONE_OPTION_ID }}
+        with:
+          script: |
+            // This is an example for GitHub Projects (v2). It does nothing unless org-level
+            // variables are configured. See comments below for setup.  
+            const reqVars = [
+              'ORG_LOGIN','PROJECT_NUMBER','STATUS_FIELD_ID',
+              'TO_DO_OPTION_ID','IN_PROGRESS_OPTION_ID','IN_REVIEW_OPTION_ID','DONE_OPTION_ID'
+            ];
+            const cfg = Object.fromEntries(reqVars.map(k => [k, process.env[k]]));
+            if (Object.values(cfg).some(v => !v)) {
+              core.info('Project sync skipped: required ORG variables not set.');
+              return;
+            }
+            const STATUS = ["To Do","In Progress","In Review","Done"];
+            const issue = context.payload.issue;
+            if (!issue || issue.pull_request) return;
+            const labels = issue.labels.map(l => typeof l === 'string' ? l : l.name);
+            const status = STATUS.find(s => labels.includes(s)) || 'To Do';
+            const optionMap = {
+              'To Do': process.env.TO_DO_OPTION_ID,
+              'In Progress': process.env.IN_PROGRESS_OPTION_ID,
+              'In Review': process.env.IN_REVIEW_OPTION_ID,
+              'Done': process.env.DONE_OPTION_ID
+            };
+            const fieldId = process.env.STATUS_FIELD_ID;
+
+            // Upsert the issue into the org project and set the status field
+            const { data: { organization } } = await github.graphql(
+              `query($login: String!, $number: Int!) {
+                 organization(login: $login) { projectV2(number: $number) { id } }
+               }`,
+              { login: process.env.ORG_LOGIN, number: parseInt(process.env.PROJECT_NUMBER, 10) }
+            );
+            const projectId = organization?.projectV2?.id;
+            if (!projectId) { core.info('Project not found; skipping.'); return; }
+
+            // Add or get project item for this issue
+            const nodeId = issue.node_id;
+            const addResp = await github.graphql(
+              `mutation($projectId: ID!, $contentId: ID!) {
+                 addProjectV2ItemById(input: {projectId: $projectId, contentId: $contentId}) {
+                   item { id }
+                 }
+               }`,
+              { projectId, contentId: nodeId }
+            );
+            const itemId = addResp?.addProjectV2ItemById?.item?.id;
+            if (!itemId) { core.info('Item add failed; skipping.'); return; }
+
+            // Set the Status field
+            const optId = optionMap[status];
+            if (!optId) { core.info('No option ID for status; skipping.'); return; }
+            await github.graphql(
+              `mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+                 updateProjectV2ItemFieldValue(input: {
+                   projectId: $projectId,
+                   itemId: $itemId,
+                   fieldId: $fieldId,
+                   value: { singleSelectOptionId: $optionId }
+                 }) { clientMutationId }
+               }`,
+              { projectId, itemId, fieldId, optionId: optId }
+            );
+            core.info(`Synced issue #${issue.number} to project with status: ${status}`);
+
+      - name: Usage notes
+        run: |
+          echo "This is an example workflow. To enable it org-wide, set organization variables:" \
+               "ORG_LOGIN, ORG_PROJECT_NUMBER, ORG_PROJECT_STATUS_FIELD_ID, and option IDs." \
+               "Leaving them unset makes this workflow a no-op."

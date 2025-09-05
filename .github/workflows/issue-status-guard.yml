@@ -1,0 +1,59 @@
+name: Issue Status Guard
+
+on:
+  issues:
+    types: [opened, edited, labeled, unlabeled, reopened, closed]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  enforce-status:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce single status label and defaults
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const STATUS = ["To Do", "In Progress", "In Review", "Done"];
+            const ev = context.payload.action;
+            const issue = context.payload.issue;
+            if (!issue || issue.pull_request) return; // ignore PRs
+
+            // current labels
+            const names = issue.labels.map(l => typeof l === 'string' ? l : l.name);
+            const setLabels = async (labels) => {
+              await github.rest.issues.setLabels({ ...context.repo, issue_number: issue.number, labels });
+            };
+
+            // Helper to collapse to exactly one status label
+            const collapse = (labels, keep) => {
+              const others = labels.filter(l => !STATUS.includes(l));
+              return Array.from(new Set([...others, keep]));
+            };
+
+            // On close → force Done and remove other status labels
+            if (ev === 'closed') {
+              return setLabels(collapse(names, 'Done'));
+            }
+
+            // If a status label was just added, make it the single status
+            if (ev === 'labeled' && context.payload.label && STATUS.includes(context.payload.label.name)) {
+              return setLabels(collapse(names, context.payload.label.name));
+            }
+
+            // For other events, if no status present → default to To Do
+            const hasStatus = names.some(n => STATUS.includes(n));
+            if (!hasStatus) {
+              return setLabels(Array.from(new Set([...names, 'To Do'])));
+            }
+
+            // If more than one status present (edge), keep precedence order by STATUS array
+            const present = STATUS.filter(s => names.includes(s));
+            if (present.length > 1) {
+              return setLabels(collapse(names, present[0]));
+            }
+
+            // Nothing to change
+            return;
